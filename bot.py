@@ -1,60 +1,142 @@
-import os, logging
-from huggingface_hub import InferenceClient
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+import os
+import requests
+import time
+import random
+import string
+import re
+import telebot
+from telebot import types
+from deep_translator import GoogleTranslator
 
-logging.basicConfig(level=logging.INFO)
+# --- إعدادات الأمان (سحب التوكن من Railway) ---
+BOT_TOKEN = os.getenv("BOT_TOKEN") 
+bot = telebot.TeleBot(BOT_TOKEN)
 
-# جلب الإعدادات
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-HF_TOKEN = os.getenv("HF_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+class CakuAPI:
+    def __init__(self):
+        self.base_url = "https://caku.ai"
+        self.mail_url = "https://api.mail.tm"
+        self.session = requests.Session()
+        self.session.headers.update({
+            "accept": "*/*",
+            "content-type": "application/json",
+            "origin": "https://caku.ai",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        })
+        self.email = None
+        self.mail_token = None
 
-# الاتصال المباشر بـ Hugging Face (هذا يمنع خطأ 402)
-client = InferenceClient(token=HF_TOKEN)
+    def _rand(self, n=10):
+        return ''.join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    keyboard = [['📸 صورة إلى فيديو'], ['🎨 نص إلى صورة']]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    await update.message.reply_text("🚀 أهلاً بك! اختر المهمة:", reply_markup=reply_markup)
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    text = update.message.text
-
-    if text == '📸 صورة إلى فيديو':
-        context.user_data['mode'] = 'i2v'
-        await update.message.reply_text("أرسل الصورة الآن...")
-    elif text == '🎨 نص إلى صورة':
-        context.user_data['mode'] = 't2i'
-        await update.message.reply_text("أرسل وصف الصورة بالإنجليزية:")
-    elif context.user_data.get('mode') == 't2i':
-        msg = await update.message.reply_text("⏳ جاري التوليد مجاناً...")
+    def _create_mail(self):
         try:
-            # استخدام موديل مجاني مباشرة بدون وسيط
-            image = client.text_to_image(text, model="black-forest-labs/FLUX.1-schnell")
-            image.save("out.png")
-            await update.message.reply_photo(photo=open("out.png", "rb"))
-        except Exception as e:
-            await msg.edit_text(f"❌ خطأ: تأكد من الـ Token في Railway")
+            r = requests.get(f"{self.mail_url}/domains")
+            domain = r.json()["hydra:member"][0]["domain"]
+            self.email = f"{self._rand(12)}@{domain}"
+            pwd = f"Pass{random.randint(1000,9999)}!"
+            payload = {"address": self.email, "password": pwd}
+            requests.post(f"{self.mail_url}/accounts", json=payload)
+            r = requests.post(f"{self.mail_url}/token", json=payload)
+            self.mail_token = r.json().get("token")
+            return True
+        except: return False
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get('mode') == 'i2v':
-        msg = await update.message.reply_text("⏳ جاري تحويل الصورة لفيديو (مجاناً)...")
-        photo = await update.message.photo[-1].get_file()
-        await photo.download_to_drive("img.jpg")
+    def _get_verify_link(self, timeout=60):
+        if not self.mail_token: return None
+        headers = {"Authorization": f"Bearer {self.mail_token}"}
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                r = requests.get(f"{self.mail_url}/messages", headers=headers)
+                msgs = r.json().get("hydra:member", [])
+                if msgs:
+                    r = requests.get(f"{self.mail_url}/messages/{msgs[0]['id']}", headers=headers)
+                    text = r.json().get("html", [""])[0]
+                    m = re.search(r"token=([a-zA-Z0-9._-]{20,})", text)
+                    if m: return f"{self.base_url}/api/auth/verify-email?token={m.group(1).rstrip('\"\'&;')}&callbackURL=/dashboard"
+            except: pass
+            time.sleep(5)
+        return None
+
+    def register(self):
+        if not self._create_mail(): return False
+        data = {"email": self.email, "password": self._rand(12), "name": self._rand(8), "callbackURL": "/dashboard"}
+        self.session.post(f"{self.base_url}/api/auth/sign-up/email", json=data)
+        link = self._get_verify_link()
+        if link:
+            self.session.get(link)
+            return True
+        return False
+
+    def modify_image(self, prompt, image_url):
+        boundary = self._rand(16)
+        form = (
+            f"------{boundary}\r\n"
+            f'Content-Disposition: form-data; name="prompt"\r\n\r\n{prompt}\r\n'
+            f"------{boundary}\r\n"
+            f'Content-Disposition: form-data; name="model"\r\n\r\nnano-banana\r\n'
+            f"------{boundary}\r\n"
+            f'Content-Disposition: form-data; name="inputMode"\r\n\r\nurl\r\n'
+            f"------{boundary}\r\n"
+            f'Content-Disposition: form-data; name="imageUrls"\r\n\r\n["{image_url}"]\r\n'
+            f"------{boundary}--\r\n"
+        )
+        headers = self.session.headers.copy()
+        headers["content-type"] = f"multipart/form-data; boundary=----{boundary}"
         try:
-            with open("img.jpg", "rb") as f:
-                video_data = client.image_to_video(f.read(), model="ali-vilab/i2vgen-xl")
-            with open("vid.mp4", "wb") as f: f.write(video_data)
-            await update.message.reply_video(video=open("vid.mp4", "rb"))
-        except Exception as e:
-            await msg.edit_text("❌ السيرفر مزدحم حالياً، حاول مرة أخرى بعد قليل.")
+            r = self.session.post(f"{self.base_url}/api/image/generate", data=form.encode(), headers=headers)
+            task_id = r.json().get("taskId")
+            return self._wait(task_id)
+        except: return None
 
+    def _wait(self, task_id):
+        if not task_id: return None
+        for _ in range(30):
+            try:
+                r = self.session.get(f"{self.base_url}/api/image/status/{task_id}")
+                res = r.json()
+                if res.get("status") == 1: return res.get("outputImage")
+            except: pass
+            time.sleep(3)
+        return None
+
+# --- البوت ---
+@bot.message_handler(commands=['start'])
+def start(message):
+    bot.reply_to(message, "🚀 أهلاً بك! أرسل لي أي صورة واكتب في الوصف (Caption) التعديل الذي تريده باللغة العربية أو الإنجليزية.")
+
+@bot.message_handler(content_types=['photo'])
+def handle_photo(message):
+    if not message.caption:
+        bot.reply_to(message, "❌ من فضلك أرسل الوصف مع الصورة (مثلاً: حولها إلى رسم زيتي).")
+        return
+
+    status_msg = bot.reply_to(message, "⏳ جاري المعالجة (إنشاء حساب + تعديل).. انتظر قليلاً.")
+    
+    try:
+        # تجهيز رابط الصورة والترجمة
+        file_info = bot.get_file(message.photo[-1].file_id)
+        image_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
+        
+        prompt = message.caption
+        if re.search('[\u0600-\u06FF]', prompt):
+            prompt = GoogleTranslator(source='auto', target='en').translate(prompt)
+
+        api = CakuAPI()
+        if api.register():
+            result = api.modify_image(prompt, image_url)
+            if result:
+                bot.send_photo(message.chat.id, result, caption="✅ تم التعديل بواسطة ذكاء Caku")
+                bot.delete_message(message.chat.id, status_msg.message_id)
+            else:
+                bot.edit_message_text("❌ فشل المحرك في تعديل الصورة.", message.chat.id, status_msg.message_id)
+        else:
+            bot.edit_message_text("❌ فشل في إنشاء حساب تلقائي.", message.chat.id, status_msg.message_id)
+    except Exception as e:
+        bot.edit_message_text(f"⚠️ خطأ فني: {str(e)}", message.chat.id, status_msg.message_id)
+
+# تشغيل البوت
 if __name__ == "__main__":
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.run_polling()
+    print("Bot is running...")
+    bot.infinity_polling()
