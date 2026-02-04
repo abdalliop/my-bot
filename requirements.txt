@@ -1,4 +1,3 @@
-python-telegram-bot
-huggingface_hub
-httpx
-Pillow
+pyTelegramBotAPI
+requests
+deep_translator
