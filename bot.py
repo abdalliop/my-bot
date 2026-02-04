@@ -8,7 +8,7 @@ import telebot
 from telebot import types
 from deep_translator import GoogleTranslator
 
-# --- إعدادات الأمان (سحب التوكن من Railway) ---
+# --- إعدادات الأمان ---
 BOT_TOKEN = os.getenv("BOT_TOKEN") 
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -54,7 +54,10 @@ class CakuAPI:
                     r = requests.get(f"{self.mail_url}/messages/{msgs[0]['id']}", headers=headers)
                     text = r.json().get("html", [""])[0]
                     m = re.search(r"token=([a-zA-Z0-9._-]{20,})", text)
-                    if m: return f"{self.base_url}/api/auth/verify-email?token={m.group(1).rstrip('\"\'&;')}&callbackURL=/dashboard"
+                    if m:
+                        # تصحيح الخطأ البرمجي هنا (إزالة المائل العكسي من الـ f-string)
+                        clean_token = m.group(1).strip("'\"&;")
+                        return self.base_url + "/api/auth/verify-email?token=" + clean_token + "&callbackURL=/dashboard"
             except: pass
             time.sleep(5)
         return None
@@ -71,7 +74,7 @@ class CakuAPI:
 
     def modify_image(self, prompt, image_url):
         boundary = self._rand(16)
-        form = (
+        form_data = (
             f"------{boundary}\r\n"
             f'Content-Disposition: form-data; name="prompt"\r\n\r\n{prompt}\r\n'
             f"------{boundary}\r\n"
@@ -85,7 +88,7 @@ class CakuAPI:
         headers = self.session.headers.copy()
         headers["content-type"] = f"multipart/form-data; boundary=----{boundary}"
         try:
-            r = self.session.post(f"{self.base_url}/api/image/generate", data=form.encode(), headers=headers)
+            r = self.session.post(f"{self.base_url}/api/image/generate", data=form_data.encode('utf-8'), headers=headers)
             task_id = r.json().get("taskId")
             return self._wait(task_id)
         except: return None
@@ -101,21 +104,19 @@ class CakuAPI:
             time.sleep(3)
         return None
 
-# --- البوت ---
+# --- معالجة البوت ---
 @bot.message_handler(commands=['start'])
 def start(message):
-    bot.reply_to(message, "🚀 أهلاً بك! أرسل لي أي صورة واكتب في الوصف (Caption) التعديل الذي تريده باللغة العربية أو الإنجليزية.")
+    bot.reply_to(message, "🚀 أهلاً بك! أرسل لي أي صورة واكتب في الوصف (Caption) التعديل المطلوب.")
 
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
     if not message.caption:
-        bot.reply_to(message, "❌ من فضلك أرسل الوصف مع الصورة (مثلاً: حولها إلى رسم زيتي).")
+        bot.reply_to(message, "❌ أرسل الوصف مع الصورة.")
         return
 
-    status_msg = bot.reply_to(message, "⏳ جاري المعالجة (إنشاء حساب + تعديل).. انتظر قليلاً.")
-    
+    status_msg = bot.reply_to(message, "⏳ جاري المعالجة.. انتظر قليلاً.")
     try:
-        # تجهيز رابط الصورة والترجمة
         file_info = bot.get_file(message.photo[-1].file_id)
         image_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
         
@@ -127,15 +128,17 @@ def handle_photo(message):
         if api.register():
             result = api.modify_image(prompt, image_url)
             if result:
-                bot.send_photo(message.chat.id, result, caption="✅ تم التعديل بواسطة ذكاء Caku")
+                bot.send_photo(message.chat.id, result, caption="✅ تم التعديل")
                 bot.delete_message(message.chat.id, status_msg.message_id)
             else:
-                bot.edit_message_text("❌ فشل المحرك في تعديل الصورة.", message.chat.id, status_msg.message_id)
+                bot.edit_message_text("❌ فشل التعديل.", message.chat.id, status_msg.message_id)
         else:
-            bot.edit_message_text("❌ فشل في إنشاء حساب تلقائي.", message.chat.id, status_msg.message_id)
+            bot.edit_message_text("❌ فشل إنشاء الحساب.", message.chat.id, status_msg.message_id)
     except Exception as e:
-        bot.edit_message_text(f"⚠️ خطأ فني: {str(e)}", message.chat.id, status_msg.message_id)
+        bot.edit_message_text(f"⚠️ خطأ: {str(e)}", message.chat.id, status_msg.message_id)
 
+if __name__ == "__main__":
+    bot.infinity_polling()
 # تشغيل البوت
 if __name__ == "__main__":
     print("Bot is running...")
